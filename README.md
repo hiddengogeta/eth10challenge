@@ -19,7 +19,8 @@ Obrigado, **Mestre Cacatal**, por disponibilizar o código e a metodologia de
 
 - 🔗 Código original: https://github.com/lmajowka/eth10challenge
 - 🎥 Canal do Mestre Cacatal no YouTube
-- 💬 Comunidade de caçadores: http://maestroapp.cloud/invite/22b097...
+- 💬 Comunidade de caçadores: https://maestroapp.cloud/workspaces/20ed9a61-1e61-4dc3-85ae-b5edd1ccb57a
+- 🎮 Discord da comunidade: https://discord.com/invite/ZFP4QrWney
 - ⛏️ Bitcoin Puzzles: https://bitcoinpuzzles.io
 
 Este port:
