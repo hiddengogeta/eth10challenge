@@ -23,6 +23,15 @@ Obrigado, **Mestre Cacatal**, por disponibilizar o código e a metodologia de
 - 🎮 Discord da comunidade: https://discord.com/invite/ZFP4QrWney
 - ⛏️ Bitcoin Puzzles: https://bitcoinpuzzles.io
 - 📘 Grupo no Facebook: https://www.facebook.com/groups/1436355617246687
+## 🤖 Codado com ajuda de IA
+
+Este port foi desenvolvido com o auxílio de modelos de IA generativa rodando no
+**Cline** (agente de código no editor):
+
+- 🧠 **GLM 5.3 Flash (xhigh)** — auxiliou na portabilidade **CUDA → OpenCL**;
+- 🧠 **DeepSeek V4 Flash (xhigh)** — auxiliou na revisão e otimização do código.
+
+Toda mudança foi revisada e validada com o `--selftest` antes de ser publicada.
 
 Este port:
 - Substitui os kernels `kernels.cu` (CUDA) por `src/ocl/kernels.cl` (OpenCL C),
