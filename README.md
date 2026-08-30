@@ -1,44 +1,46 @@
 # Words Breaker — OpenCL (Intel Arc)
 
-> **Port para GPU Intel Arc do [Words Breaker](https://github.com/lmajowka/eth10challenge)**
-> Código original: [github.com/lmajowka/eth10challenge](https://github.com/lmajowka/eth10challenge)
-> (versão NVIDIA/CUDA: [words-breaker-gpu](https://github.com/lmajowka/words-breaker-gpu))
+> **Port for Intel Arc GPU of [Words Breaker](https://github.com/lmajowka/eth10challenge)**
+> Original code: [github.com/lmajowka/eth10challenge](https://github.com/lmajowka/eth10challenge)
+> (NVIDIA/CUDA version: [words-breaker-gpu](https://github.com/lmajowka/words-breaker-gpu))
 
 ---
 
-## Créditos & Agradecimentos
+## Credits & Acknowledgments
 
-Este repositório é um **port do código do Mestre Cacatal (Leonardo Majowka,
-[@lmajowka](https://github.com/lmajowka))** do backend **CUDA (NVIDIA)** para
-**OpenCL (qualquer GPU — testado na Intel Arc B580)**, usando a mesma
-derivação padrão MetaMask `m/44'/60'/0'/0/0`.
+This repository is a **port of the code by Mestre Cacatal (Leonardo Majowka,
+[@lmajowka](https://github.com/lmajowka))** from a **CUDA (NVIDIA)** backend to
+**OpenCL (any GPU — tested on an Intel Arc B580)**, using the same
+MetaMask default derivation `m/44'/60'/0'/0/0`.
 
-Obrigado, **Mestre Cacatal**, por disponibilizar o código e a metodologia de
-`--pattern`/`--pool` que tornaram possível testar as teorias do desafio de
-**8,6 ETH (~R$ 100 mil)** que está parado há 6 anos! 🧙🏻‍♂️
+Thanks, **Mestre Cacatal**, for making the code and the
+`--pattern`/`--pool` methodology available, which made it possible to test the
+theories of the **8.6 ETH (~R$ 100K)** challenge that has been sitting
+untouched for 6 years! 🧙🏻‍♂️
 
-- 🔗 Código original: https://github.com/lmajowka/eth10challenge
-- 🎥 Canal do Mestre Cacatal no YouTube: https://www.youtube.com/@investidorint
-- 💬 Comunidade de caçadores: https://maestroapp.cloud/invite/22b0978e49d1c06ce733fc6ef5701500
-- 🎮 Discord da comunidade: https://discord.com/invite/ZFP4QrWney
+- 🔗 Original code: https://github.com/lmajowka/eth10challenge
+- 🎥 Mestre Cacatal's YouTube channel: https://www.youtube.com/@investidorint
+- 💬 Hunters community: https://maestroapp.cloud/invite/22b0978e49d1c06ce733fc6ef5701500
+- 🎮 Community Discord: https://discord.com/invite/ZFP4QrWney
 - ⛏️ Bitcoin Puzzles: https://bitcoinpuzzles.io
-- 📘 Grupo no Facebook: https://www.facebook.com/groups/1436355617246687
-## 🤖 Codado com ajuda de IA
+- 📘 Facebook group: https://www.facebook.com/groups/1436355617246687
 
-Este port foi desenvolvido com o auxílio de modelos de IA generativa rodando no
-**Cline** (agente de código no editor):
+## 🤖 Built with AI assistance
 
-- 🧠 **GLM 5.3 Flash (xhigh)** — auxiliou na portabilidade **CUDA → OpenCL**;
-- 🧠 **DeepSeek V4 Flash (xhigh)** — auxiliou na revisão e otimização do código.
+This port was developed with the help of generative AI models running in
+**Cline** (AI coding agent in the editor):
 
-Toda mudança foi revisada e validada com o `--selftest` antes de ser publicada.
+- 🧠 **GLM 5.3 Flash (xhigh)** — helped with the **CUDA → OpenCL** portability;
+- 🧠 **DeepSeek V4 Flash (xhigh)** — helped reviewing and optimizing the code.
 
-Este port:
-- Substitui os kernels `kernels.cu` (CUDA) por `src/ocl/kernels.cl` (OpenCL C),
-  compilado pelo driver na hora de rodar — **sem nvcc / CUDA toolkit**;
-- Foi validado com `--selftest` (10/10 primitivas bit-exatas vs. referência CPU);
-- Rode numa **Intel Arc B580 a ~4,2M candidatos/s** (~1,7× mais rápido que o
-  RTX 3050 de referência no README original).
+Every change was reviewed and validated with the `--selftest` before being published.
+
+This port:
+- Replaces the `kernels.cu` (CUDA) kernels with `src/ocl/kernels.cl` (OpenCL C),
+  compiled by the driver at runtime — **no nvcc / CUDA toolkit required**;
+- Was validated with `--selftest` (10/10 bit-exact primitives vs. CPU reference);
+- Ran on an **Intel Arc B580 at ~4.2M candidates/s** (~1.7× faster than the
+  RTX 3050 reference in the original README).
 
 ---
 
