@@ -18,10 +18,11 @@ Obrigado, **Mestre Cacatal**, por disponibilizar o código e a metodologia de
 **8,6 ETH (~R$ 100 mil)** que está parado há 6 anos! 🧙🏻‍♂️
 
 - 🔗 Código original: https://github.com/lmajowka/eth10challenge
-- 🎥 Canal do Mestre Cacatal no YouTube
-- 💬 Comunidade de caçadores: https://maestroapp.cloud/workspaces/20ed9a61-1e61-4dc3-85ae-b5edd1ccb57a
+- 🎥 Canal do Mestre Cacatal no YouTube: https://www.youtube.com/@investidorint
+- 💬 Comunidade de caçadores: https://maestroapp.cloud/invite/22b0978e49d1c06ce733fc6ef5701500
 - 🎮 Discord da comunidade: https://discord.com/invite/ZFP4QrWney
 - ⛏️ Bitcoin Puzzles: https://bitcoinpuzzles.io
+- 📘 Grupo no Facebook: https://www.facebook.com/groups/1436355617246687
 
 Este port:
 - Substitui os kernels `kernels.cu` (CUDA) por `src/ocl/kernels.cl` (OpenCL C),
