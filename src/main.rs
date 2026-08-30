@@ -63,14 +63,56 @@ struct Args {
     #[arg(long)]
     selftest: bool,
 
+    /// Hidden: candidate batch size for each GPU kernel launch.
+    /// 4M was the empirical sweet spot on the Intel Arc B580 (160 CUs): larger
+    /// batches keep the second queue busy and hide the H2D cost, smaller ones
+    /// finish a batch before the next can overlap. Past 8M the curve is flat.
+    #[arg(long, hide = true, default_value_t = 1 << 22)]
+    batch_size: usize,
+
+    /// Hidden: OpenCL work-group size for the search kernels.
+    /// 64 lines up with the kernel's preferred subgroup size and keeps enough
+    /// work-items in flight to fill 160 CUs; 16/32 underfill, 128 doesn't help.
+    #[arg(long, hide = true, default_value_t = 64)]
+    local_size: usize,
+
     /// Force the CPU (rayon) search instead of the GPU. The GPU is used by
     /// default when an OpenCL GPU device is available.
     #[arg(long)]
     cpu: bool,
+
+    /// Hidden: sweep (batch, local) configurations in a single process and
+    /// print steady-state throughput. Used to tune the GPU path.
+    #[arg(long, hide = true, default_value_t = false)]
+    bench: bool,
+
+    /// Hidden: seconds per configuration in --bench mode.
+    #[arg(long, hide = true, default_value_t = 6.0)]
+    bench_seconds: f64,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    anyhow::ensure!(args.batch_size > 0, "--batch-size must be greater than zero");
+    anyhow::ensure!(args.local_size > 0, "--local-size must be greater than zero");
+    anyhow::ensure!(args.bench_seconds > 0.0, "--bench-seconds must be positive");
+
+    if args.bench {
+        let gpu = gpu::Gpu::new()?;
+        let wordlist: &'static [&'static str] = english_words();
+        let gpu_wordlist = gpu::GpuWordlist::new(wordlist)?;
+        let target = [0u8; 20];
+        let configs: Vec<(usize, usize)> = vec![
+            (1 << 18, 16), (1 << 18, 32), (1 << 18, 64),
+            (1 << 19, 16), (1 << 19, 32), (1 << 19, 64),
+            (1 << 20, 16), (1 << 20, 32), (1 << 20, 64),
+            (1 << 21, 16), (1 << 21, 32), (1 << 21, 64),
+        ];
+        let best = gpu.bench(&gpu_wordlist, &target, &configs, args.bench_seconds)?;
+        println!("\nBest: {best} cand/s");
+        return Ok(());
+    }
 
     if args.selftest {
         println!("Running GPU primitive selftests...");
@@ -103,7 +145,15 @@ fn main() -> Result<()> {
     let found = if args.cpu {
         run_cpu_search(&args, slots, &pool, &fill, wordlist, language, &target)?
     } else {
-        match search_gpu(slots, &pool, &fill, wordlist, &target) {
+        match search_gpu(
+            slots,
+            &pool,
+            &fill,
+            wordlist,
+            &target,
+            args.batch_size,
+            args.local_size,
+        ) {
             Ok(found) => found,
             Err(e) => {
                 eprintln!("GPU search unavailable ({e:#}); falling back to CPU.");
@@ -275,14 +325,21 @@ fn search_gpu(
     fill: &[u16],
     wordlist: &'static [&'static str],
     target: &[u8; 20],
+    batch_size: usize,
+    local_size: usize,
 ) -> Result<bool> {
     let gpu = gpu::Gpu::new()?;
     println!("Using GPU (OpenCL)");
 
     let gpu_wordlist = gpu::GpuWordlist::new(wordlist)?;
     let candidates = candidates::stream_parallel(slots, pool.to_vec(), fill.to_vec());
-    let batch_size = 1 << 20;
-    let hit = gpu.search(candidates, &gpu_wordlist, target, batch_size)?;
+    let hit = gpu.search(
+        candidates,
+        &gpu_wordlist,
+        target,
+        batch_size,
+        local_size,
+    )?;
 
     match hit {
         Some(h) => {
@@ -338,6 +395,10 @@ pub fn format_number(n: usize) -> String {
     } else {
         n.to_string()
     }
+}
+
+fn english_words() -> &'static [&'static str] {
+    Language::English.words_by_prefix("")
 }
 
 fn parse_language(lang: &str) -> Result<Language> {

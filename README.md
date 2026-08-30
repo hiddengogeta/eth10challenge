@@ -39,8 +39,10 @@ This port:
 - Replaces the `kernels.cu` (CUDA) kernels with `src/ocl/kernels.cl` (OpenCL C),
   compiled by the driver at runtime — **no nvcc / CUDA toolkit required**;
 - Was validated with `--selftest` (10/10 bit-exact primitives vs. CPU reference);
-- Ran on an **Intel Arc B580 at ~4.2M candidates/s** (~1.7× faster than the
-  RTX 3050 reference in the original README).
+- Ran on an **Intel Arc B580 at ~2.57M candidates/s** steady-state with the
+  256-GRF build (double-buffered queue pipeline, 4M-batch / 64-thread kernel
+  config). Latest measurements and the per-config sweep are in
+  [Performance](#performance).
 
 ---
 
@@ -71,6 +73,35 @@ this tool will not find it as-is.
 
 The original NVIDIA/CUDA version is preserved in `src/cuda/kernels.cu` for
 reference; it is not compiled by this tree anymore.
+
+### Performance
+
+Measured on the **Intel Arc B580** (160 CUs, driver `intel-compute-runtime`
+26.27), 20s steady-state per config (`wb_bench.sh <batch> <local> 20`).
+
+| Config | Throughput (cand/s) |
+|---|---:|
+| 1M × 16 | 2,413,872 |
+| 1M × 32 | 2,413,955 |
+| 1M × 64 | 2,368,023 |
+| 2M × 64 (default GRF) | 2,481,386 |
+| 2M × 64 (256-GRF) | **2,574,425** |
+| 4M × 64 (default GRF) | 2,507,867 |
+| 4M × 64 (256-GRF) | **2,569,103** |
+| 8M × 64 | 2,514,725 |
+
+The hot path is k_pipeline (PBKDF2-HMAC-SHA512, 2048 iterations) — ~94% of
+runtime. The remaining ~6% is the cheap k_filter pass (BIP-39 checksum). The
+double-buffered queue pipeline (filter queue + heavy pipeline queue) keeps
+the device busy while the host pre-fills the next candidate batch. The 256-GRF
+option (`-cl-intel-256-GRF-per-thread`) is auto-detected at startup: the
+program tries it first and falls back silently to the default on older
+drivers, so the binary remains portable.
+
+The rate is also bounded by the **k_pipeline private memory of ~64 KB per
+work-item** (reported by the OpenCL driver). Reducing that is what would
+unlock the next tier; the kernel is bit-exact, so any further optimization
+has to keep `--selftest` and the BIP-39 known-answer test green.
 
 ### OpenCL library path
 

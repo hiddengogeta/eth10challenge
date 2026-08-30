@@ -22,16 +22,20 @@ const CL_SRC: &str = include_str!("ocl/kernels.cl");
 
 /// Work-group size used by the selftest kernels.
 const LOCAL_SIZE: usize = 256;
-/// Work-group size used by the two search kernels (k_filter / k_pipeline).
-const SEARCH_LOCAL_SIZE: usize = 64;
 /// Fixed-base table of multiples of G: 64 windows x 15 entries, each an affine
 /// point (2 x 32 bytes) = 61440 bytes.
 const GTABLE_BYTES: usize = 64 * 15 * 64;
 
 /// Owns the OpenCL context + compiled program for the lifetime of a run.
 pub struct Gpu {
+    device: Device,
     _context: Context,
+    /// Queue for transfers + the cheap checksum filter pass.
     queue: CommandQueue,
+    /// Queue for the heavy derivation pass. A separate queue lets a pipeline
+    /// kernel run concurrently with the next batch's filter/transfers, keeping
+    /// the device busy instead of stalling on per-batch sync points.
+    pipeline_queue: CommandQueue,
     program: Program,
     /// The fixed-base window table of multiples of G, built once by
     /// `k_init_gtable` and read by every kernel that derives a public key.
@@ -69,9 +73,27 @@ impl Gpu {
         let _context = Context::from_device(&device).context("OpenCL context creation failed")?;
         let queue =
             CommandQueue::create_default(&_context, 0).context("creating OpenCL command queue")?;
-        let program = Program::create_and_build_from_source(&_context, CL_SRC, "")
-            .map_err(|e| anyhow::anyhow!("building OpenCL kernels: {e}"))
-            .context("compiling src/ocl/kernels.cl")?;
+        let pipeline_queue = CommandQueue::create_default(&_context, 0)
+            .context("creating OpenCL pipeline command queue")?;
+        // Build the program. The Intel OpenCL driver accepts `-cl-intel-256-GRF-
+        // per-thread` on Arc/Xe GPUs, which gives each work-item the larger
+        // register file and is empirically ~3-5% faster on k_pipeline here
+        // (measured on the B580). The option is ignored on non-Intel drivers
+        // (NEO) and on older Intel drivers, so the first try uses it; if the
+        // driver rejects it (very old IGC, non-Intel ICD), we fall back to the
+        // default. Either way, the resulting binary is bit-exact: registers
+        // change scheduling, not semantics, and the existing selftest covers
+        // every primitive.
+        let program = match Program::create_and_build_from_source(
+            &_context,
+            CL_SRC,
+            "-cl-intel-256-GRF-per-thread",
+        ) {
+            Ok(p) => p,
+            Err(_) => Program::create_and_build_from_source(&_context, CL_SRC, "")
+                .map_err(|e| anyhow::anyhow!("building OpenCL kernels: {e}"))
+                .context("compiling src/ocl/kernels.cl")?,
+        };
 
         // Build the fixed-base window table of multiples of G. Every kernel that
         // derives a public key reads it, so it must run before anything else.
@@ -93,8 +115,10 @@ impl Gpu {
 
         println!("OpenCL device: {device_name}");
         Ok(Self {
+            device,
             _context,
             queue,
+            pipeline_queue,
             program,
             gtable,
         })
@@ -382,30 +406,74 @@ impl Gpu {
         wordlist: &GpuWordlist,
         target: &[u8; 20],
         batch_size: usize,
+        local_size: usize,
     ) -> Result<Option<SearchHit>> {
+        anyhow::ensure!(batch_size > 0, "GPU batch size must be greater than zero");
+        anyhow::ensure!(
+            batch_size <= u32::MAX as usize,
+            "GPU batch size exceeds the OpenCL kernel's u32 limit"
+        );
+        anyhow::ensure!(local_size > 0, "OpenCL work-group size must be greater than zero");
+        let candidate_words = batch_size
+            .checked_mul(12)
+            .context("GPU candidate-buffer size overflow")?;
+
         let d_wordlist = self.buffer_from_slice(&wordlist.packed, CL_MEM_READ_ONLY)?;
         let d_lens = self.buffer_from_slice(&wordlist.lens, CL_MEM_READ_ONLY)?;
         let d_target = self.buffer_from_slice(target, CL_MEM_READ_ONLY)?;
-        let filter = Kernel::create(&self.program, "k_filter")?;
-        let pipeline = Kernel::create(&self.program, "k_pipeline")?;
+        // Host scratch for zeroing device flags/counters. Lives for the whole
+        // search so non-blocking writes can refer to it safely.
+        let zero_host = [0u32];
 
-        // All device buffers are allocated once and reused. Allocating inside
-        // the loop costs buffer create/destroy per batch, each of which can
-        // implicitly synchronize the device.
-        let d_survivors = self.new_buffer::<u32>(batch_size, CL_MEM_READ_WRITE)?;
-        let mut d_cand = self.new_buffer::<u16>(batch_size * 12, CL_MEM_READ_WRITE)?;
-        let mut d_counter = self.buffer_from_slice(&[0u32], CL_MEM_READ_WRITE)?;
-        let d_found_flag = self.buffer_from_slice(&[0u32], CL_MEM_READ_WRITE)?;
-        let d_found_idx = self.buffer_from_slice(&[0u32], CL_MEM_READ_WRITE)?;
+        // Two slots ping-pong between the two queues. Each slot owns its device
+        // buffers and kernel objects so a batch in flight never shares memory
+        // or kernel-argument state with the batch overlapping it from the other
+        // queue.
+        struct Slot {
+            d_cand: Buffer<u16>,
+            d_surv: Buffer<u32>,
+            d_counter: Buffer<u32>,
+            d_found_flag: Buffer<u32>,
+            d_found_idx: Buffer<u32>,
+            k_filter: Kernel,
+            k_pipe: Kernel,
+            buf: Option<Vec<u16>>,
+            n: usize,
+            count: [u32; 1],
+            flag: [u32; 1],
+            ev_rc: Option<opencl3::event::Event>,
+            ev_rf: Option<opencl3::event::Event>,
+            piped: bool,
+        }
+
+        fn make_slot(g: &Gpu, batch_size: usize, candidate_words: usize) -> Result<Slot> {
+            Ok(Slot {
+                d_cand: g.new_buffer::<u16>(candidate_words, CL_MEM_READ_WRITE)?,
+                d_surv: g.new_buffer::<u32>(batch_size, CL_MEM_READ_WRITE)?,
+                d_counter: g.new_buffer::<u32>(1, CL_MEM_READ_WRITE)?,
+                d_found_flag: g.new_buffer::<u32>(1, CL_MEM_READ_WRITE)?,
+                d_found_idx: g.new_buffer::<u32>(1, CL_MEM_READ_WRITE)?,
+                k_filter: Kernel::create(&g.program, "k_filter")?,
+                k_pipe: Kernel::create(&g.program, "k_pipeline")?,
+                buf: None,
+                n: 0,
+                count: [0u32; 1],
+                flag: [0u32; 1],
+                ev_rc: None,
+                ev_rf: None,
+                piped: false,
+            })
+        }
 
         // Generating a batch takes ~10-15% of the time the GPU spends on it, and
         // it used to run between launches with the device idle. A producer thread
-        // fills the next batch while the current one is in flight; buffers cycle
-        // back over `empty` so nothing is reallocated.
+        // fills the next batch while the current ones are in flight; buffers cycle
+        // back over `empty` so nothing is reallocated. The pool depth (2) matches
+        // the two double-buffered slots.
         let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<Vec<u16>>(1);
         let (empty_tx, empty_rx) = std::sync::mpsc::channel::<Vec<u16>>();
         for _ in 0..2 {
-            let _ = empty_tx.send(Vec::with_capacity(batch_size * 12));
+            let _ = empty_tx.send(Vec::with_capacity(candidate_words));
         }
         let producer = std::thread::spawn(move || {
             let mut it = candidates;
@@ -417,82 +485,237 @@ impl Gpu {
                         None => break,
                     }
                 }
-                let last = buf.len() < batch_size * 12;
+                let last = buf.len() < candidate_words;
                 // A send error just means the consumer stopped (hit found).
                 if full_tx.send(buf).is_err() || last {
                     return;
                 }
             }
         });
+        let mut slots = [
+            make_slot(self, batch_size, candidate_words)?,
+            make_slot(self, batch_size, candidate_words)?,
+        ];
+        let filter_limit = slots[0].k_filter.get_work_group_size(self.device.id())?;
+        let pipeline_limit = slots[0].k_pipe.get_work_group_size(self.device.id())?;
+        let work_group_limit = filter_limit.min(pipeline_limit);
+        anyhow::ensure!(
+            local_size <= work_group_limit,
+            "OpenCL work-group size {local_size} exceeds this kernel's limit ({work_group_limit})"
+        );
+        if std::env::var_os("WORDS_BREAKER_DIAGNOSTICS").is_some() {
+            let preferred = slots[0]
+                .k_pipe
+                .get_work_group_size_multiple(self.device.id())?;
+            let private_bytes = slots[0].k_pipe.get_private_mem_size(self.device.id())?;
+            eprintln!(
+                "OpenCL search config: batch={batch_size}, local={local_size}, \
+                 kernel_limit={work_group_limit}, preferred_multiple={preferred}, \
+                 pipeline_private_mem={private_bytes} B/work-item"
+            );
+        }
+        // Pipeline register counters: `head` = next batch to fill into a slot,
+        // `mid` = next batch to promote to the pipeline queue, `tail` = next
+        // batch to drain. At most two batches are in flight (one per slot).
+        let mut head = 0usize;
+        let mut mid = 0usize;
+        let mut tail = 0usize;
+        let mut producer_done = false;
+        let mut seen = 0usize; // candidates in drained batches
 
-        let mut batch_start: usize = 0;
-        let mut checked: usize = 0;
-
-        let result = loop {
-            let buf = match full_rx.recv() {
-                Ok(b) => b,
-                Err(_) => break None, // producer finished
-            };
-            if buf.is_empty() {
-                break None;
-            }
-            let n = buf.len() / 12;
-
-            self.write(&mut d_cand, &buf)?;
-            self.write(&mut d_counter, &[0u32])?;
-
-            // Pass 1: checksum filter -> compacted survivors.
-            unsafe {
-                filter.set_arg(0, &d_cand)?;
-                filter.set_arg(1, &(n as u32))?;
-                filter.set_arg(2, &d_survivors)?;
-                filter.set_arg(3, &d_counter)?;
-            }
-            self.launch(&filter, n, SEARCH_LOCAL_SIZE)?;
-            let mut counter = [0u32; 1];
-            self.read(&d_counter, &mut counter)?;
-            let count = counter[0] as usize;
-
-            // Pass 2: heavy derivation over survivors only.
-            if count > 0 {
-                unsafe {
-                    pipeline.set_arg(0, &d_cand)?;
-                    pipeline.set_arg(1, &d_survivors)?;
-                    pipeline.set_arg(2, &(count as u32))?;
-                    pipeline.set_arg(3, &d_wordlist)?;
-                    pipeline.set_arg(4, &d_lens)?;
-                    pipeline.set_arg(5, &(wordlist.stride as u32))?;
-                    pipeline.set_arg(6, &d_target)?;
-                    pipeline.set_arg(7, &d_found_flag)?;
-                    pipeline.set_arg(8, &d_found_idx)?;
-                    pipeline.set_arg(9, &self.gtable)?;
+        let result = 'search: loop {
+            // 1) Refill: enqueue the next batch's cheap pass (H2D writes + filter
+            //    + count readback) on the filter queue, if a slot is free.
+            if head - tail < 2 && !producer_done {
+                let s = head % 2;
+                match full_rx.recv() {
+                    Ok(buf) if !buf.is_empty() => {
+                        let n = buf.len() / 12;
+                        slots[s].buf = Some(buf);
+                        slots[s].n = n;
+                        let slot = &mut slots[s];
+                        let data = slot.buf.as_deref().unwrap();
+                        let _ew = unsafe {
+                            self.queue.enqueue_write_buffer(
+                                &mut slot.d_cand,
+                                0, // non-blocking; data lives in slot.buf
+                                0,
+                                data,
+                                &[],
+                            )?
+                        };
+                        let _ec = unsafe {
+                            self.queue.enqueue_write_buffer(
+                                &mut slot.d_counter,
+                                0,
+                                0,
+                                &zero_host,
+                                &[],
+                            )?
+                        };
+                        let _ef0 = unsafe {
+                            self.queue.enqueue_write_buffer(
+                                &mut slot.d_found_flag,
+                                0,
+                                0,
+                                &zero_host,
+                                &[],
+                            )?
+                        };
+                        unsafe {
+                            slot.k_filter.set_arg(0, &slot.d_cand)?;
+                            slot.k_filter.set_arg(1, &(n as u32))?;
+                            slot.k_filter.set_arg(2, &slot.d_surv)?;
+                            slot.k_filter.set_arg(3, &slot.d_counter)?;
+                        }
+                        let global = n.div_ceil(local_size).max(1) * local_size;
+                        let garr = [global];
+                        let larr = [local_size];
+                        let ev_f = unsafe {
+                            self.queue.enqueue_nd_range_kernel(
+                                slot.k_filter.get(),
+                                1,
+                                std::ptr::null(),
+                                garr.as_ptr(),
+                                larr.as_ptr(),
+                                &[],
+                            )?
+                        };
+                        let waits = [ev_f.get()];
+                        let ev_rc = unsafe {
+                            self.queue.enqueue_read_buffer(
+                                &mut slot.d_counter,
+                                0,
+                                0,
+                                &mut slot.count,
+                                &waits,
+                            )?
+                        };
+                        slot.ev_rc = Some(ev_rc);
+                        head += 1;
+                    }
+                    // Producer finished or sent the (empty) final marker.
+                    _ => producer_done = true,
                 }
-                self.launch(&pipeline, count, SEARCH_LOCAL_SIZE)?;
+                continue;
+            }
+// 2) Promote: promote the oldest batch to the heavy pipeline queue.
+            if mid < head {
+                let s = mid % 2;
+                let slot = &mut slots[s];
+                let rc_ev = slot.ev_rc.take();
+                if let Some(ev) = &rc_ev {
+                    ev.wait()?;
+                }
+                let count = slot.count[0] as usize;
+                if count > 0 {
+                    unsafe {
+                        slot.k_pipe.set_arg(0, &slot.d_cand)?;
+                        slot.k_pipe.set_arg(1, &slot.d_surv)?;
+                        slot.k_pipe.set_arg(2, &(count as u32))?;
+                        slot.k_pipe.set_arg(3, &d_wordlist)?;
+                        slot.k_pipe.set_arg(4, &d_lens)?;
+                        slot.k_pipe.set_arg(5, &(wordlist.stride as u32))?;
+                        slot.k_pipe.set_arg(6, &d_target)?;
+                        slot.k_pipe.set_arg(7, &slot.d_found_flag)?;
+                        slot.k_pipe.set_arg(8, &slot.d_found_idx)?;
+                        slot.k_pipe.set_arg(9, &self.gtable)?;
+                    }
+                    let global = count.div_ceil(local_size).max(1) * local_size;
+                    let garr = [global];
+                    let larr = [local_size];
+                    let waits = rc_ev.iter().map(|e| e.get()).collect::<Vec<_>>();
+                    let ev_p = unsafe {
+                        self.pipeline_queue.enqueue_nd_range_kernel(
+                            slot.k_pipe.get(),
+                            1,
+                            std::ptr::null(),
+                            garr.as_ptr(),
+                            larr.as_ptr(),
+                            &waits,
+                        )?
+                    };
+                    let pwaits = [ev_p.get()];
+                    let ev_rf = unsafe {
+                        self.pipeline_queue.enqueue_read_buffer(
+                            &mut slot.d_found_flag,
+                            0,
+                            0,
+                            &mut slot.flag,
+                            &pwaits,
+                        )?
+                    };
+                    slot.ev_rf = Some(ev_rf);
+                    slot.piped = true;
+                } else {
+                    slot.piped = false;
+                    slot.ev_rf = None;
+                }
+                mid += 1;
+                continue;
             }
 
-            let mut found_flag = [0u32; 1];
-            self.read(&d_found_flag, &mut found_flag)?;
-            if found_flag[0] != 0 {
-                let mut found_idx = [0u32; 1];
-                self.read(&d_found_idx, &mut found_idx)?;
-                let local = found_idx[0] as usize;
-                let mut indices = [0u16; 12];
-                indices.copy_from_slice(&buf[local * 12..local * 12 + 12]);
-                break Some(SearchHit {
-                    global_index: batch_start + local,
-                    indices,
-                });
+            // 3) Drain: reap the oldest batch once its found-flag readback is in.
+            if tail < mid {
+                let s = tail % 2;
+                let mut hit: Option<SearchHit> = None;
+                {
+                    let slot = &mut slots[s];
+                    if slot.piped {
+                        if let Some(ev) = slot.ev_rf.take() {
+                            ev.wait()?;
+                        }
+                    }
+                    if slot.piped && slot.flag[0] != 0 {
+                        let mut idx = [0u32; 1];
+                        let ev = unsafe {
+                            self.pipeline_queue.enqueue_read_buffer(
+                                &mut slot.d_found_idx,
+                                0,
+                                0,
+                                &mut idx,
+                                &[],
+                            )?
+                        };
+                        ev.wait()?;
+                        let local = idx[0] as usize;
+                        if let Some(buf) = &slot.buf {
+                            if local < slot.n {
+                                let mut indices = [0u16; 12];
+                                let base = local * 12;
+                                indices.copy_from_slice(&buf[base..base + 12]);
+                                hit = Some(SearchHit {
+                                    global_index: seen + local,
+                                    indices,
+                                });
+                            }
+                        }
+                    }
+                }
+                // Hand the buffer back to the producer pool.
+                if let Some(buf) = slots[s].buf.take() {
+                    let _ = empty_tx.send(buf);
+                }
+                seen += slots[s].n;
+                slots[s].n = 0;
+                slots[s].count = [0u32; 1];
+                slots[s].flag = [0u32; 1];
+                slots[s].ev_rf = None;
+                slots[s].piped = false;
+
+                if let Some(h) = hit {
+                    break 'search Some(h);
+                }
+                println!("Checked {} candidates...", crate::format_number(seen));
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                tail += 1;
+                continue;
             }
 
-            checked += n;
-            batch_start += n;
-            let short_batch = n < batch_size;
-            let _ = empty_tx.send(buf);
-            println!("Checked {} candidates...", crate::format_number(checked));
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            if short_batch {
-                break None; // last (partial) batch
+            // 4) All batches processed.
+            if producer_done && head == tail {
+                break 'search None;
             }
         };
 
@@ -504,6 +727,142 @@ impl Gpu {
         drop(empty_tx);
         let _ = producer.join();
         Ok(result)
+    }
+
+    /// Sweeps (batch, local) combinations in a single process, measuring the
+    /// steady-state kernel throughput. Warm-up is the first completed batch of
+    /// every configuration. Returns the best rate (candidates per second).
+    pub fn bench(
+        &self,
+        wordlist: &GpuWordlist,
+        target: &[u8; 20],
+        configs: &[(usize, usize)],
+        seconds: f64,
+    ) -> Result<usize> {
+        let d_wordlist = self.buffer_from_slice(&wordlist.packed, CL_MEM_READ_ONLY)?;
+        let d_lens = self.buffer_from_slice(&wordlist.lens, CL_MEM_READ_ONLY)?;
+        let d_target = self.buffer_from_slice(target, CL_MEM_READ_ONLY)?;
+        let k_filter = Kernel::create(&self.program, "k_filter")?;
+        let k_pipe = Kernel::create(&self.program, "k_pipeline")?;
+        let limit = k_filter
+            .get_work_group_size(self.device.id())?
+            .min(k_pipe.get_work_group_size(self.device.id())?);
+        let survivor_cap = configs.iter().map(|(b, _)| *b).max().unwrap_or(1);
+        let d_surv = self.new_buffer::<u32>(survivor_cap, CL_MEM_READ_WRITE)?;
+        let mut d_counter = self.buffer_from_slice(&[0u32], CL_MEM_READ_WRITE)?;
+        let mut d_found_flag = self.buffer_from_slice(&[0u32], CL_MEM_READ_WRITE)?;
+        let d_found_idx = self.buffer_from_slice(&[0u32], CL_MEM_READ_WRITE)?;
+        let mut d_cand = self.new_buffer::<u16>(survivor_cap * 12, CL_MEM_READ_WRITE)?;
+        let zero_host = [0u32];
+
+        // Synthetic input: 100k candidates with u16 word indices in [0, 2047).
+        // The exact contents do not matter for the throughput measurement; we
+        // only need every thread to do real cryptographic work without ever
+        // triggering a hit.
+        let n_in = 100_000usize;
+        let mut host: Vec<u16> = Vec::with_capacity(n_in * 12);
+        let mut s: u32 = 0xc0ffee_u32;
+        for _ in 0..n_in * 12 {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            host.push(((s >> 16) as u16) & 0x07ff);
+        }
+        self.write(&mut d_cand, &host)?;
+
+        let mut rate_max = 0usize;
+        for &(batch_size, local_size) in configs {
+            if local_size > limit || batch_size == 0 || batch_size > survivor_cap {
+                println!("  skip batch={batch_size} local={local_size}: out of range");
+                continue;
+            }
+            unsafe {
+                k_filter.set_arg(0, &d_cand)?;
+                k_filter.set_arg(1, &(n_in as u32))?;
+                k_filter.set_arg(2, &d_surv)?;
+                k_filter.set_arg(3, &d_counter)?;
+                k_pipe.set_arg(0, &d_cand)?;
+                k_pipe.set_arg(1, &d_surv)?;
+                k_pipe.set_arg(2, &(n_in as u32))?;
+                k_pipe.set_arg(3, &d_wordlist)?;
+                k_pipe.set_arg(4, &d_lens)?;
+                k_pipe.set_arg(5, &(wordlist.stride as u32))?;
+                k_pipe.set_arg(6, &d_target)?;
+                k_pipe.set_arg(7, &d_found_flag)?;
+                k_pipe.set_arg(8, &d_found_idx)?;
+                k_pipe.set_arg(9, &self.gtable)?;
+            }
+
+            let global = n_in.div_ceil(local_size).max(1) * local_size;
+            let garr = [global];
+            let larr = [local_size];
+            // Warm-up batch: primes the constant caches and any first-touch overhead.
+            unsafe {
+                self.queue.enqueue_write_buffer(&mut d_counter, 0, 0, &zero_host, &[])?;
+                self.queue.enqueue_write_buffer(&mut d_found_flag, 0, 0, &zero_host, &[])?;
+                self.queue.enqueue_nd_range_kernel(
+                    k_filter.get(),
+                    1,
+                    std::ptr::null(),
+                    garr.as_ptr(),
+                    larr.as_ptr(),
+                    &[],
+                )?;
+                self.queue.enqueue_nd_range_kernel(
+                    k_pipe.get(),
+                    1,
+                    std::ptr::null(),
+                    garr.as_ptr(),
+                    larr.as_ptr(),
+                    &[],
+                )?;
+            }
+            self.queue.finish()?;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+            let t_start = std::time::Instant::now();
+            let mut total: u64 = 0;
+            let mut batches: u32 = 0;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                unsafe {
+                    self.queue.enqueue_write_buffer(&mut d_counter, 0, 0, &zero_host, &[])?;
+                    self.queue.enqueue_write_buffer(&mut d_found_flag, 0, 0, &zero_host, &[])?;
+                    self.queue.enqueue_nd_range_kernel(
+                        k_filter.get(),
+                        1,
+                        std::ptr::null(),
+                        garr.as_ptr(),
+                        larr.as_ptr(),
+                        &[],
+                    )?;
+                    self.queue.enqueue_nd_range_kernel(
+                        k_pipe.get(),
+                        1,
+                        std::ptr::null(),
+                        garr.as_ptr(),
+                        larr.as_ptr(),
+                        &[],
+                    )?;
+                }
+                self.queue.finish()?;
+                total = total.wrapping_add(n_in as u64);
+                batches += 1;
+            }
+            let elapsed = t_start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 {
+                (total as f64 / elapsed) as usize
+            } else {
+                0
+            };
+            println!(
+                "  batch={batch_size:>7} local={local_size:>3} -> {batches:>3} batches, {rate:>10} cand/s"
+            );
+            if rate > rate_max {
+                rate_max = rate;
+            }
+        }
+        Ok(rate_max)
     }
 }
 
